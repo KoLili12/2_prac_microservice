@@ -1,255 +1,238 @@
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
-const CircuitBreaker = require('opossum');
+const { createProxyMiddleware } = require('http-proxy-middleware');
+const pinoHttp = require('pino-http');
+const logger = require('./src/config/logger');
+const { USERS_SERVICE_URL, ORDERS_SERVICE_URL } = require('./src/config/services');
+const { authenticateToken } = require('./src/middleware/auth');
+const { generalLimiter, authLimiter } = require('./src/middleware/rateLimiter');
+const requestIdMiddleware = require('./src/middleware/requestId');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-
-// Service URLs
-const USERS_SERVICE_URL = 'http://service_users:8000';
-const ORDERS_SERVICE_URL = 'http://service_orders:8000';
-
-// Circuit Breaker configuration
-const circuitOptions = {
-    timeout: 3000, // Timeout for requests (3 seconds)
-    errorThresholdPercentage: 50, // Open circuit after 50% of requests fail
-    resetTimeout: 3000, // Wait 30 seconds before trying to close the circuit
+// CORS configuration
+const corsOptions = {
+  origin: process.env.CORS_ORIGIN || '*',
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Request-ID'],
+  exposedHeaders: ['X-Request-ID', 'RateLimit-Limit', 'RateLimit-Remaining', 'RateLimit-Reset'],
+  credentials: true,
+  maxAge: 86400 // 24 hours
 };
 
-// Create circuit breakers for each service
-const usersCircuit = new CircuitBreaker(async (url, options = {}) => {
-    try {
-        const response = await axios({
-            url, ...options,
-            validateStatus: status => (status >= 200 && status < 300) || status === 404
-        });
-        return response.data;
-    } catch (error) {
-        if (error.response && error.response.status === 404) {
-            return error.response.data;
-        }
-        throw error;
-    }
-}, circuitOptions);
+// Basic middleware
+app.use(cors(corsOptions));
+app.use(express.json());
+app.use(requestIdMiddleware);
 
-const ordersCircuit = new CircuitBreaker(async (url, options = {}) => {
-    try {
-        const response = await axios({
-            url, ...options,
-            validateStatus: status => (status >= 200 && status < 300) || status === 404
-        });
-        return response.data;
-    } catch (error) {
-        if (error.response && error.response.status === 404) {
-            return error.response.data;
-        }
-        throw error;
-    }
-}, circuitOptions);
+// HTTP logging with Pino
+app.use(pinoHttp({
+  logger,
+  customLogLevel: (req, res, err) => {
+    if (res.statusCode >= 500 || err) return 'error';
+    if (res.statusCode >= 400) return 'warn';
+    return 'info';
+  },
+  customSuccessMessage: (req, res) => {
+    return `${req.method} ${req.url} ${res.statusCode}`;
+  },
+  customErrorMessage: (req, res, err) => {
+    return `${req.method} ${req.url} ${res.statusCode} - ${err.message}`;
+  }
+}));
 
-// Fallback functions
-usersCircuit.fallback(() => ({error: 'Users service temporarily unavailable'}));
-ordersCircuit.fallback(() => ({error: 'Orders service temporarily unavailable'}));
+// Rate limiting
+app.use(generalLimiter);
 
-// Routes with Circuit Breaker
-app.get('/users/:userId', async (req, res) => {
-    try {
-        const user = await usersCircuit.fire(`${USERS_SERVICE_URL}/users/${req.params.userId}`);
-        if (user.error === 'User not found') {
-            res.status(404).json(user);
-        } else {
-            res.json(user);
-        }
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
+// Auth rate limiting для логина и регистрации
+app.use('/v1/users/login', authLimiter);
+app.use('/v1/users/register', authLimiter);
 
-app.post('/users', async (req, res) => {
-    try {
-        const user = await usersCircuit.fire(`${USERS_SERVICE_URL}/users`, {
-            method: 'POST',
-            data: req.body
-        });
-        res.status(201).json(user);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
+// JWT authentication middleware
+app.use(authenticateToken);
 
-app.get('/users', async (req, res) => {
-    try {
-        const users = await usersCircuit.fire(`${USERS_SERVICE_URL}/users`);
-        res.json(users);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.delete('/users/:userId', async (req, res) => {
-    try {
-        const result = await usersCircuit.fire(`${USERS_SERVICE_URL}/users/${req.params.userId}`, {
-            method: 'DELETE'
-        });
-        res.json(result);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.put('/users/:userId', async (req, res) => {
-    try {
-        const user = await usersCircuit.fire(`${USERS_SERVICE_URL}/users/${req.params.userId}`, {
-            method: 'PUT',
-            data: req.body
-        });
-        res.json(user);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.get('/orders/:orderId', async (req, res) => {
-    try {
-        const order = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders/${req.params.orderId}`);
-        if (order.error === 'Order not found') {
-            res.status(404).json(order);
-        } else {
-            res.json(order);
-        }
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.post('/orders', async (req, res) => {
-    try {
-        const order = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders`, {
-            method: 'POST',
-            data: req.body
-        });
-        res.status(201).json(order);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.get('/orders', async (req, res) => {
-    try {
-        const orders = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders`);
-        res.json(orders);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.delete('/orders/:orderId', async (req, res) => {
-    try {
-        const result = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders/${req.params.orderId}`, {
-            method: 'DELETE'
-        });
-        res.json(result);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.put('/orders/:orderId', async (req, res) => {
-    try {
-        const order = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders/${req.params.orderId}`, {
-            method: 'PUT',
-            data: req.body
-        });
-        res.json(order);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.get('/orders/status', async (req, res) => {
-    try {
-        const status = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders/status`);
-        res.json(status);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-app.get('/orders/health', async (req, res) => {
-    try {
-        const health = await ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders/health`);
-        res.json(health);
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-// Gateway Aggregation: Get user details with their orders
-app.get('/users/:userId/details', async (req, res) => {
-    try {
-        const userId = req.params.userId;
-
-        // Get user details
-        const userPromise = usersCircuit.fire(`${USERS_SERVICE_URL}/users/${userId}`);
-
-        // Get user's orders (assuming orders have a userId field)
-        const ordersPromise = ordersCircuit.fire(`${ORDERS_SERVICE_URL}/orders`)
-            .then(orders => orders.filter(order => order.userId == userId));
-
-        // Wait for both requests to complete
-        const [user, userOrders] = await Promise.all([userPromise, ordersPromise]);
-
-        // If user not found, return 404
-        if (user.error === 'User not found') {
-            return res.status(404).json(user);
-        }
-
-        // Return aggregated response
-        res.json({
-            user,
-            orders: userOrders
-        });
-    } catch (error) {
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-// Health check endpoint that shows circuit breaker status
+// Health check endpoint
 app.get('/health', (req, res) => {
-    res.json({
-        status: 'API Gateway is running',
-        circuits: {
-            users: {
-                status: usersCircuit.status,
-                stats: usersCircuit.stats
-            },
-            orders: {
-                status: ordersCircuit.status,
-                stats: ordersCircuit.stats
-            }
-        }
-    });
+  res.json({
+    status: 'OK',
+    service: 'API Gateway',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
 });
 
 app.get('/status', (req, res) => {
-    res.json({status: 'API Gateway is running'});
+  res.json({
+    status: 'API Gateway is running',
+    timestamp: new Date().toISOString()
+  });
 });
+
+// Proxy configuration for Users Service
+const usersProxyOptions = {
+  target: USERS_SERVICE_URL,
+  changeOrigin: true,
+  pathRewrite: (path, req) => {
+    // Перенаправляем /v1/users/* на сервис пользователей как есть
+    return path;
+  },
+  onProxyReq: (proxyReq, req, res) => {
+    // Прокидываем X-Request-ID
+    if (req.id) {
+      proxyReq.setHeader('X-Request-ID', req.id);
+    }
+
+    // Прокидываем информацию о пользователе из JWT
+    if (req.headers['x-user-id']) {
+      proxyReq.setHeader('X-User-ID', req.headers['x-user-id']);
+      proxyReq.setHeader('X-User-Email', req.headers['x-user-email']);
+      proxyReq.setHeader('X-User-Roles', req.headers['x-user-roles']);
+    }
+
+    logger.info({
+      requestId: req.id,
+      method: req.method,
+      path: req.path,
+      target: USERS_SERVICE_URL
+    }, 'Proxying to Users Service');
+  },
+  onProxyRes: (proxyRes, req, res) => {
+    // Прокидываем X-Request-ID обратно
+    if (req.id) {
+      proxyRes.headers['x-request-id'] = req.id;
+    }
+  },
+  onError: (err, req, res) => {
+    logger.error({
+      err,
+      requestId: req.id,
+      method: req.method,
+      path: req.path,
+      target: USERS_SERVICE_URL
+    }, 'Proxy error to Users Service');
+
+    res.status(503).json({
+      success: false,
+      error: {
+        code: 'SERVICE_UNAVAILABLE',
+        message: 'Users service is temporarily unavailable'
+      }
+    });
+  }
+};
+
+// Proxy configuration for Orders Service
+const ordersProxyOptions = {
+  target: ORDERS_SERVICE_URL,
+  changeOrigin: true,
+  pathRewrite: (path, req) => {
+    // Перенаправляем /v1/orders/* на сервис заказов как есть
+    return path;
+  },
+  onProxyReq: (proxyReq, req, res) => {
+    // Прокидываем X-Request-ID
+    if (req.id) {
+      proxyReq.setHeader('X-Request-ID', req.id);
+    }
+
+    // Прокидываем информацию о пользователе из JWT
+    if (req.headers['x-user-id']) {
+      proxyReq.setHeader('X-User-ID', req.headers['x-user-id']);
+      proxyReq.setHeader('X-User-Email', req.headers['x-user-email']);
+      proxyReq.setHeader('X-User-Roles', req.headers['x-user-roles']);
+    }
+
+    logger.info({
+      requestId: req.id,
+      method: req.method,
+      path: req.path,
+      target: ORDERS_SERVICE_URL
+    }, 'Proxying to Orders Service');
+  },
+  onProxyRes: (proxyRes, req, res) => {
+    // Прокидываем X-Request-ID обратно
+    if (req.id) {
+      proxyRes.headers['x-request-id'] = req.id;
+    }
+  },
+  onError: (err, req, res) => {
+    logger.error({
+      err,
+      requestId: req.id,
+      method: req.method,
+      path: req.path,
+      target: ORDERS_SERVICE_URL
+    }, 'Proxy error to Orders Service');
+
+    res.status(503).json({
+      success: false,
+      error: {
+        code: 'SERVICE_UNAVAILABLE',
+        message: 'Orders service is temporarily unavailable'
+      }
+    });
+  }
+};
+
+// Setup proxies
+app.use('/v1/users', createProxyMiddleware(usersProxyOptions));
+app.use('/v1/orders', createProxyMiddleware(ordersProxyOptions));
+
+// 404 Handler
+app.use((req, res) => {
+  logger.warn({ requestId: req.id, path: req.path }, 'Route not found');
+  res.status(404).json({
+    success: false,
+    error: {
+      code: 'NOT_FOUND',
+      message: 'Resource not found'
+    }
+  });
+});
+
+// Error handler
+app.use((err, req, res, next) => {
+  logger.error({
+    err,
+    requestId: req.id,
+    path: req.path,
+    method: req.method
+  }, 'Unhandled error');
+
+  res.status(500).json({
+    success: false,
+    error: {
+      code: 'INTERNAL_ERROR',
+      message: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message
+    }
+  });
+});
+
+// Graceful shutdown
+const gracefulShutdown = () => {
+  logger.info('Shutting down gracefully...');
+  server.close(() => {
+    logger.info('Server closed');
+    process.exit(0);
+  });
+
+  // Force shutdown after 30 seconds
+  setTimeout(() => {
+    logger.error('Forced shutdown');
+    process.exit(1);
+  }, 30000);
+};
+
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
 
 // Start server
-app.listen(PORT, () => {
-    console.log(`API Gateway running on port ${PORT}`);
-
-    // Log circuit breaker events for monitoring
-    usersCircuit.on('open', () => console.log('Users circuit breaker opened'));
-    usersCircuit.on('close', () => console.log('Users circuit breaker closed'));
-    usersCircuit.on('halfOpen', () => console.log('Users circuit breaker half-open'));
-
-    ordersCircuit.on('open', () => console.log('Orders circuit breaker opened'));
-    ordersCircuit.on('close', () => console.log('Orders circuit breaker closed'));
-    ordersCircuit.on('halfOpen', () => console.log('Orders circuit breaker half-open'));
+const server = app.listen(PORT, '0.0.0.0', () => {
+  logger.info(`API Gateway running on port ${PORT}`);
+  logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  logger.info(`Users Service: ${USERS_SERVICE_URL}`);
+  logger.info(`Orders Service: ${ORDERS_SERVICE_URL}`);
 });
+
+module.exports = { app, server };
