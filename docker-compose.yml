@@ -67,6 +67,7 @@ services:
       - DB_PASSWORD=admin123
       - DB_NAME=microservice_db
       - SERVICE_USERS_URL=http://service_users:3001
+      - JWT_SECRET=${JWT_SECRET:-your-secret-key-change-in-production}
     networks:
       - app-network
     depends_on:

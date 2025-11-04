@@ -23,7 +23,6 @@ const corsOptions = {
 
 // Basic middleware
 app.use(cors(corsOptions));
-app.use(express.json());
 app.use(requestIdMiddleware);
 
 // HTTP logging with Pino
