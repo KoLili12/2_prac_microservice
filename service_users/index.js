@@ -1,90 +1,92 @@
 const express = require('express');
 const cors = require('cors');
+const pinoHttp = require('pino-http');
+const logger = require('./src/config/logger');
+const pool = require('./src/config/db');
+const usersRoutes = require('./src/routes/users');
+const errorHandler = require('./src/middleware/errorHandler');
+const requestIdMiddleware = require('./src/middleware/requestId');
 
 const app = express();
-const PORT = process.env.PORT || 8000;
+const PORT = process.env.PORT || 3001;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.use(requestIdMiddleware);
 
-// Имитация базы данных в памяти (LocalStorage)
-let fakeUsersDb = {};
-let currentId = 1;
+// HTTP логирование с Pino
+app.use(pinoHttp({
+  logger,
+  customLogLevel: (req, res, err) => {
+    if (res.statusCode >= 500 || err) return 'error';
+    if (res.statusCode >= 400) return 'warn';
+    return 'info';
+  },
+  customSuccessMessage: (req, res) => {
+    return `${req.method} ${req.url} ${res.statusCode}`;
+  },
+  customErrorMessage: (req, res, err) => {
+    return `${req.method} ${req.url} ${res.statusCode} - ${err.message}`;
+  }
+}));
 
-// Routes
-app.get('/users', (req, res) => {
-    const users = Object.values(fakeUsersDb);
-    res.json(users);
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    service: 'Users Service',
+    timestamp: new Date().toISOString()
+  });
 });
 
-app.post('/users', (req, res) => {
-    const userData = req.body;
-    const userId = currentId++;
+// API Routes v1
+app.use('/v1/users', usersRoutes);
 
-    const newUser = {
-        id: userId,
-        ...userData
-    };
-
-    fakeUsersDb[userId] = newUser;
-    res.status(201).json(newUser);
-});
-
-app.get('/users/health', (req, res) => {
-    res.json({
-        status: 'OK',
-        service: 'Users Service',
-        timestamp: new Date().toISOString()
-    });
-});
-
-app.get('/users/status', (req, res) => {
-    res.json({status: 'Users service is running'});
-});
-
-app.get('/users/:userId', (req, res) => {
-    const userId = parseInt(req.params.userId);
-    const user = fakeUsersDb[userId];
-
-    if (!user) {
-        return res.status(404).json({error: 'User not found'});
+// 404 Handler
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: {
+      code: 'NOT_FOUND',
+      message: 'Resource not found'
     }
-
-    res.json(user);
+  });
 });
 
-app.put('/users/:userId', (req, res) => {
-    const userId = parseInt(req.params.userId);
-    const updates = req.body;
+// Error handler (должен быть последним)
+app.use(errorHandler);
 
-    if (!fakeUsersDb[userId]) {
-        return res.status(404).json({error: 'User not found'});
-    }
+// Graceful shutdown
+const gracefulShutdown = async () => {
+  logger.info('Shutting down gracefully...');
 
-    const updatedUser = {
-        ...fakeUsersDb[userId],
-        ...updates
-    };
+  try {
+    await pool.end();
+    logger.info('Database connections closed');
+    process.exit(0);
+  } catch (err) {
+    logger.error({ err }, 'Error during shutdown');
+    process.exit(1);
+  }
+};
 
-    fakeUsersDb[userId] = updatedUser;
-    res.json(updatedUser);
-});
-
-app.delete('/users/:userId', (req, res) => {
-    const userId = parseInt(req.params.userId);
-
-    if (!fakeUsersDb[userId]) {
-        return res.status(404).json({error: 'User not found'});
-    }
-
-    const deletedUser = fakeUsersDb[userId];
-    delete fakeUsersDb[userId];
-
-    res.json({message: 'User deleted', deletedUser});
-});
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
 
 // Start server
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Users service running on port ${PORT}`);
+const server = app.listen(PORT, '0.0.0.0', async () => {
+  logger.info(`Users service running on port ${PORT}`);
+  logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
+
+  // Проверка подключения к БД
+  try {
+    await pool.query('SELECT NOW()');
+    logger.info('Database connection verified');
+  } catch (err) {
+    logger.error({ err }, 'Failed to connect to database');
+    process.exit(1);
+  }
 });
+
+module.exports = { app, server };
