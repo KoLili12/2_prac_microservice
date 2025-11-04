@@ -1,96 +1,92 @@
 const express = require('express');
 const cors = require('cors');
+const pinoHttp = require('pino-http');
+const logger = require('./src/config/logger');
+const pool = require('./src/config/db');
+const ordersRoutes = require('./src/routes/orders');
+const errorHandler = require('./src/middleware/errorHandler');
+const requestIdMiddleware = require('./src/middleware/requestId');
 
 const app = express();
-const PORT = process.env.PORT || 8000;
+const PORT = process.env.PORT || 3002;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.use(requestIdMiddleware);
 
-// Имитация базы данных в памяти (LocalStorage)
-let fakeOrdersDb = {};
-let currentId = 1;
+// HTTP логирование с Pino
+app.use(pinoHttp({
+  logger,
+  customLogLevel: (req, res, err) => {
+    if (res.statusCode >= 500 || err) return 'error';
+    if (res.statusCode >= 400) return 'warn';
+    return 'info';
+  },
+  customSuccessMessage: (req, res) => {
+    return `${req.method} ${req.url} ${res.statusCode}`;
+  },
+  customErrorMessage: (req, res, err) => {
+    return `${req.method} ${req.url} ${res.statusCode} - ${err.message}`;
+  }
+}));
 
-// Routes
-app.get('/orders/status', (req, res) => {
-    res.json({status: 'Orders service is running'});
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    service: 'Orders Service',
+    timestamp: new Date().toISOString()
+  });
 });
 
-app.get('/orders/health', (req, res) => {
-    res.json({
-        status: 'OK',
-        service: 'Orders Service',
-        timestamp: new Date().toISOString()
-    });
-});
+// API Routes v1
+app.use('/v1/orders', ordersRoutes);
 
-app.get('/orders/:orderId', (req, res) => {
-    const orderId = parseInt(req.params.orderId);
-    const order = fakeOrdersDb[orderId];
-
-    if (!order) {
-        return res.status(404).json({error: 'Order not found'});
+// 404 Handler
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: {
+      code: 'NOT_FOUND',
+      message: 'Resource not found'
     }
-
-    res.json(order);
+  });
 });
 
-app.get('/orders', (req, res) => {
-    let orders = Object.values(fakeOrdersDb);
+// Error handler (должен быть последним)
+app.use(errorHandler);
 
-    // Добавляем фильтрацию по userId если передан параметр
-    if (req.query.userId) {
-        const userId = parseInt(req.query.userId);
-        orders = orders.filter(order => order.userId === userId);
-    }
+// Graceful shutdown
+const gracefulShutdown = async () => {
+  logger.info('Shutting down gracefully...');
 
-    res.json(orders);
-});
+  try {
+    await pool.end();
+    logger.info('Database connections closed');
+    process.exit(0);
+  } catch (err) {
+    logger.error({ err }, 'Error during shutdown');
+    process.exit(1);
+  }
+};
 
-app.post('/orders', (req, res) => {
-    const orderData = req.body;
-    const orderId = currentId++;
-
-    const newOrder = {
-        id: orderId,
-        ...orderData
-    };
-
-    fakeOrdersDb[orderId] = newOrder;
-    res.status(201).json(newOrder);
-});
-
-app.put('/orders/:orderId', (req, res) => {
-    const orderId = parseInt(req.params.orderId);
-    const orderData = req.body;
-
-    if (!fakeOrdersDb[orderId]) {
-        return res.status(404).json({error: 'Order not found'});
-    }
-
-    fakeOrdersDb[orderId] = {
-        id: orderId,
-        ...orderData
-    };
-
-    res.json(fakeOrdersDb[orderId]);
-});
-
-app.delete('/orders/:orderId', (req, res) => {
-    const orderId = parseInt(req.params.orderId);
-
-    if (!fakeOrdersDb[orderId]) {
-        return res.status(404).json({error: 'Order not found'});
-    }
-
-    const deletedOrder = fakeOrdersDb[orderId];
-    delete fakeOrdersDb[orderId];
-
-    res.json({message: 'Order deleted', deletedOrder});
-});
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
 
 // Start server
-app.listen(PORT, () => {
-    console.log(`Orders service running on port ${PORT}`);
+const server = app.listen(PORT, '0.0.0.0', async () => {
+  logger.info(`Orders service running on port ${PORT}`);
+  logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
+
+  // Проверка подключения к БД
+  try {
+    await pool.query('SELECT NOW()');
+    logger.info('Database connection verified');
+  } catch (err) {
+    logger.error({ err }, 'Failed to connect to database');
+    process.exit(1);
+  }
 });
+
+module.exports = { app, server };
